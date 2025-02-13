@@ -1,0 +1,1195 @@
+---
+title: "Morris 1986 implemented"
+author: "Nicholas Bruns"
+date: "12/03/2022"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+NEB is implenting Morris 1986, because it has 2 ideal features: 
+  1. cohort structure 
+  2. N dynamics 
+  
+Style notes: 
+
+1. I try to seperate "science" vs. software paramemeters. Science parameters are things like rates and concetrations, software parameters are things like: the number of cohorts we track. Software parameters ar in all-caps. 
+
+2. A note on ordering of updating model state: I separate "update" from "calculate" steps. Update steps refer to last year model state, calculate steps do not. Updating depth recquires care: it looks at current carbon but past depth, so must be called after updating carbon. The rest of the update functions are independent and can be called in any order.
+
+3. R note: be sure, when retrieving list items within functions to use [[]] not []. [] returns a list with 1 element, while [[]] returns just the list element (the vectors we want)
+```{r}
+library(tidyverse)
+library(deSolve)
+library(patchwork)
+```
+
+
+
+
+
+```{r declare-model}
+
+#NOTE:
+  
+## parms: list of paramters, passed into component functions
+sedimec_model <- function(t,x,parms){
+  run_function_verbose <- FALSE #turn this on if you want printed outputs after every run for model checking
+  
+  #DEBUG-- for hand runing function
+      # x <- start_state_vector #DEBUG
+      # x <- return_vector #DEBUG
+  ##
+  
+  
+    #x comes in as a vector
+    #then I "unpack it", casting the flat vector into an R list for easier indexing throughout
+      #remember, we track 10 state variables, each over the whole column
+        #each state variable is a list element, containing a vector of 
+          #that variable across the soil column
+  model_state_old <-unpack_model_state(x,parms) 
+  new_cohort <- make_new_cohort(parms)
+  
+  ###FIRST: make the updates to model state that refer to last year model state
+    #NOTE: order for carbon and depth matters, as depth looks at new carbon
+      #but if first year, skip all this to start building up a soil column
+    if(length(model_state_old)==0  || is.na(model_state_old[["C.r"]][1])) { 
+       model_state_old_now_aged <- model_state_old
+    }else{
+      model_state_old_now_aged <- model_state_old %>% 
+        update_column_carbon(parms) %>% 
+        update_depth(parms) %>%  #NOTE: carbon must have already been updated
+        update_inorganics(parms) %>% 
+        update_particulate_organic_N(parms) %>% #note, soluble N is below
+        update_P(parms)
+    } 
+ 
+
+  #SECOND: calculate model state values that do not refer to last year model state
+  model_state_new <- model_state_old_now_aged %>% 
+    add_new_cohort(new_cohort,parms) %>%  #TODO: check if you need these parms
+    calculate_root_distribution(parms) %>% 
+    calculate_soluble_N(parms)
+ 
+  #the science choices are over, now correctly pack results and return
+  return_vector <- pack_model_state(model_state_new)
+  if(run_function_verbose){
+    print("iter result")
+    glimpse(model_state_new) 
+    
+  }
+  
+  return(list(return_vector))
+  
+}
+
+
+### model functions, in order of appearance
+
+##########
+### 1/3 utility functions
+#########
+  ##NOTE: this happens outside function! but placing it in the model declaration
+
+##use this when declaring functions so that biomass can be adjusted
+  #recquires the helper function below:
+      #depth_integration_of_exponential
+  attach_integrated_roots <- function(old_parms){
+    R_I_result <- depth_integration_of_exponential(
+      surface_value = old_parms["R_0"],
+      k=old_parms["k_1"],
+      d=old_parms["R_d"]
+    )
+    old_parms["R_I"] <- R_I_result
+   return(old_parms)
+  }
+  ##helper function used above
+      depth_integration_of_exponential <- function(surface_value,k,d){
+         surface_value*(1-exp(-k*d))/k
+      }
+
+  #generate the start state, in the "packed" vector form
+  make_SEDIMEC_start_state <- function(parms){
+    state_start_default <- parms["STATE_START_DEFAULT"] %>% as.numeric()
+    column_depth <- parms["COHORTS_N"] %>% as.numeric() #this is column depth
+    
+    #when you turn a list into a vector, you get very nice formatting!
+      # C.l_1  C.l_2  C.l_3  C.l_4  C.l_5  C.l_6  C.l_7  C.l_8  
+
+   start_state_vector <-  list(
+      C.r_=rep(state_start_default,column_depth),
+      C.l_=rep(state_start_default,column_depth),
+      
+      N.r_=rep(state_start_default,column_depth),
+      N.l_=rep(state_start_default,column_depth),
+      N.s_=rep(state_start_default,column_depth),
+      
+      P.o_=rep(state_start_default,column_depth),
+      W.i_=rep(state_start_default,column_depth), #change I to W.i
+      W.b_=rep(state_start_default,column_depth), #change B to W.b
+      D.u_=rep(state_start_default,column_depth),
+      D.b_=rep(state_start_default,column_depth)
+    ) %>% 
+      as_vector() 
+     
+    return(start_state_vector)
+  }
+  
+  unpack_model_state <- function(model_state_row,parms){
+    # model_state_row <- start_state_vector #used for debugging
+    # model_state_row <- start_state_vector #used for debugging
+    model_state_list <- list(
+      C.r=extract_soil_column_var_by_name(model_state_row,"C.r"),
+      C.l=extract_soil_column_var_by_name(model_state_row,"C.l"),
+      
+      N.r=extract_soil_column_var_by_name(model_state_row,"N.r"),
+      N.l=extract_soil_column_var_by_name(model_state_row,"N.l"),
+      N.s=extract_soil_column_var_by_name(model_state_row,"N.s"),
+      
+      P.o=extract_soil_column_var_by_name(model_state_row,"P.o"),
+      W.i=extract_soil_column_var_by_name(model_state_row,"W.i"), #change I to W.i
+      W.b=extract_soil_column_var_by_name(model_state_row,"W.b"), #change B to W.b
+      D.u=extract_soil_column_var_by_name(model_state_row,"D.u"),
+      D.b=extract_soil_column_var_by_name(model_state_row,"D.b")
+    )
+    
+    
+    return(model_state_list)
+  }
+    
+      ##HELPER FUNCTION
+      extract_soil_column_var_by_name <- function(model_state,var_name_string){
+        model_state %>% 
+          bind_rows() %>%  #this turns vector into tidyverse "tibble" for easy extraction by name
+          select(starts_with(var_name_string)) %>% 
+          as_vector() %>%  # added to move to names vectors, not tibbles
+          unname() #NAMES: removes vector names
+          }
+  
+      
+  pack_model_state <- function(model_state_list,parms){
+        name_vector_with_underscore <- model_state_list %>% 
+          names()  %>% 
+          paste0("_")
+        
+        model_state_list_temp <- model_state_list
+        names(model_state_list_temp) <- name_vector_with_underscore
+        
+       model_state_row <-  model_state_list_temp %>% 
+          as_vector()
+        return(model_state_row)
+  }
+  
+  ###TWO HELPER FUNCTIONS 
+    #needed for depth calculations
+    # and thus for both 
+      #1) update_depths in section 2/3 below
+      #2) make_new_cohort, right next in section 1/3
+      
+ 
+                calculate_iter_root_thickness_helper <- function(D_u,new_D_b,parms){
+                  R_0 <- parms["R_0"] %>% as.numeric()
+                  k_1 <- parms["k_1"] %>% as.numeric()
+                  b_o <- parms["b_o"] %>% as.numeric()
+                  R_0 * (  
+                              exp(-k_1*new_D_b)  -
+                              exp(-k_1*D_u)   
+                            )/(-k_1 * b_o) #roots in cohort divided by bulk density of OM 
+                }
+                      
+                #solve depth iteratively, following morris. How?
+                  #step 1, guess depth according to carbon only
+                    #step 2, compute roots at that depth, 
+                      # step 3, add additional depth from roots
+                        # return to step 2, 
+                          #caclluating new depth with roots and the roots at that depth
+                          #until difference between iterations 
+                          #is less that a stopping criterion
+        iteratively_obtain_D_b <- function(D_u,carbon_thickness,parms){
+          if(is.na(D_u)){
+            return(NA)
+          }
+          #initialize iteration technique
+          stop_criterion <- parms["DEPTH_SOLVE_STOP_CRITERION"]
+          cur_iter_dif <- stop_criterion + 1
+          cur_D_b <- D_u + carbon_thickness
+          while(cur_iter_dif > stop_criterion){
+           new_D_b <- D_u + carbon_thickness +
+             calculate_iter_root_thickness_helper(D_u,cur_D_b,parms)
+           
+           cur_iter_dif <- abs(new_D_b - cur_D_b)
+           
+           VERBOSE <- FALSE
+           #DEBUG PRINT STEPS
+           if(VERBOSE){
+                   print("D_B(i):")
+                   print(cur_D_b)
+                   print("D_B(i + 1):")
+                   print(new_D_b)
+                   print("difference from iteration:")
+                   print(cur_iter_dif)
+                   print(" ")
+                 }
+           
+           cur_D_b <- new_D_b 
+          }
+          return(cur_D_b)
+        }
+         
+ 
+  
+  make_new_cohort <- function(parms){
+      W_a = parms["W_a"] %>% as.numeric()
+      k_3 = parms["k_3"] %>% as.numeric()
+      k_4 = parms["k_4"] %>% as.numeric()
+      k_5 = parms["k_5"] %>% as.numeric()
+      f_c = parms["f_c"] %>% as.numeric()
+      f_n = parms["f_n"] %>% as.numeric()
+      b_o = parms["b_o"] %>% as.numeric()
+      P_0 = parms["P_0"] %>% as.numeric()
+      R_0 = parms["R_0"] %>% as.numeric()
+    
+    new_cohort <- list(
+        #first, calculate the C, N and I material 
+          # entering from organic deposition (W_a)
+        C.r = W_a *(f_c),  # 
+        C.l = W_a * (1-f_c), #C.l
+        N.r = W_a * f_n *k_5 ,
+        N.l = W_a * (1-f_n)* k_5,
+        N.s=NA, #see below note with roots
+        #second, add fixed value
+        P.o = P_0,
+        W.i = W_a * k_3 + k_4, #ash in organics and sediment
+        #Third, add things that make model go
+        W.b= NA, #soluble N and roots in new cohort should get calculated once new cohort 
+                #is appended to old cohort-- they are all calculated together. 
+                  #Set this up with NA so no silent failure
+        D.u=0
+    ) 
+  
+    #now, compute the depth of the bottom of the cohort 
+  # new_cohort_carbon_thickness <- (new_cohort$C.l[[1]] + new_cohort$C.r[[1]]) / b_o  # volume from organics
+  new_cohort_carbon_thickness <- (new_cohort$C.l + new_cohort$C.r) / b_o  # volume from organics
+  new_cohort$D.b <- iteratively_obtain_D_b(
+      D_u = new_cohort$D.u, # this is hand set above to 0
+      carbon_thickness = new_cohort_carbon_thickness,
+      parms = parms
+    )
+       
+   return(new_cohort) 
+  }
+  
+  #called via pipe:
+     # model_state_new <- model_state_old_now_aged %>% 
+     #  add_new_cohort(new_cohort,parms) %>% ...  #
+    #make sure this function appropriately handles the NULL case
+  add_new_cohort <- function(model_state_old_now_aged,new_cohort,parms){
+        # adds new cohort to old, updating all the internal lists
+        #TODO: do this last-- 
+          #design model state so the individual process functions are clear and self documenting
+        
+        model_state_with_new_cohort <- list()
+        
+        for(cur_state_var_string in names(new_cohort)){
+            # cur_state_var_string <- "D.b"
+            old_var_vector <-  model_state_old_now_aged[[cur_state_var_string]] 
+            new_var_element <- new_cohort[[cur_state_var_string]]
+            updated_vector <- c(new_var_element,old_var_vector)
+          
+          #once you get to the column length set in params, you can start dropping cohorts
+          if(length(updated_vector) > parms[["COHORTS_N"]]){
+            updated_vector <- head(updated_vector,-1)   # drops the bottom cohort
+          }
+              
+         model_state_with_new_cohort[[cur_state_var_string]] <- updated_vector
+        } 
+        return(model_state_with_new_cohort)
+    }
+
+  
+  
+##########
+### 2/3 cohort process functions, 
+###  set 1, "update function", that refer to old model state
+#########
+
+  update_column_carbon <- function(model_state_old,parms){
+    
+    
+    #retrieve what we need
+      #1/2: paramters
+      k <- parms["k"] %>% as.numeric() #decay constant for OM
+      k_2 <- parms["k_2"] %>% as.numeric()  #turnover of roots
+      f_c <- parms["f_c"] %>% as.numeric() # refractory component
+      
+      #2/2: state variables   
+      W.b_old <- model_state_old[["W.b"]] %>% as.numeric() #bg biomass
+      C.l_old <- model_state_old[["C.l"]] %>% as.numeric()
+      C.r_old <- model_state_old[["C.r"]] %>% as.numeric()
+      
+    #now do update steps      
+      #labile
+      C.l_new <- C.l_old - k* C.l_old + k_2*(1-f_c)*W.b_old
+      #refractory
+      C.r_new <- C.r_old + k_2 * f_c * W.b_old
+      
+    #updates state
+    model_state_old_new_carbon <- model_state_old
+    model_state_old_new_carbon[["C.l"]] <- C.l_new #again, be sure to use [[]] not []
+    model_state_old_new_carbon[["C.r"]] <- C.r_new #[] with replace list item with 1 number, not the whole vector
+    
+    return(model_state_old_new_carbon)
+  }
+ 
+  #NOTE: call order matters! Must have updated carbon first, both labile and refractory 
+  #requires two helper functions:
+    
+  update_depth <- function(model_state_old_new_carbon,parms){
+     #retrieve what we need
+    # model_state_old_new_carbon <-   model_state_old %>%  update_column_carbon(parms) ##FOR DEBUGGING
+      
+          #1/2: paramters
+            k_1 <- parms[["k_1"]] #root distribution parameter
+            b_o <- parms[["b_o"]]  # bulk density parameter
+            
+          #2/2: state variables   
+            C.l_new <- model_state_old_new_carbon[["C.l"]] 
+            C.r_new <- model_state_old_new_carbon[["C.r"]] 
+            D.u_old <- model_state_old_new_carbon[["D.u"]]
+            D.b_old <- model_state_old_new_carbon[["D.b"]]
+              
+            carbon_thickness_new <- (C.l_new + C.r_new)/b_o
+          #do updates 
+            D.u_new <- D.b_old 
+            
+        ### ############### ###############
+            # note below complex execution:
+              # takes two vectors, returns a third, all same length
+                 #vectors 1 and 2 are function inputs, the third is function output
+              # here, we are computing for each cohort the thickness
+                #this calculation takes 2 inputs, the cohort soil thickness and 
+                #depth to top
+              
+              #in short:  compute the function iteratively_obtain_D_b
+                #using as inputs pairs of D.u_new and carbon_thickness_new
+        ### ############### ###############
+            D.b_new<- pmap_dbl(
+                    list(
+                      D_u=D.u_new,
+                      carbon_thickness= carbon_thickness_new
+                    ),
+                    iteratively_obtain_D_b,
+                    parms=parms
+                  )
+
+        model_state_old_new_carbon_and_depth  <- model_state_old_new_carbon
+        model_state_old_new_carbon_and_depth[["D.u"]] <- D.u_new
+        model_state_old_new_carbon_and_depth[["D.b"]] <- D.b_new
+        
+      return(model_state_old_new_carbon_and_depth) 
+  }
+ 
+  #Order does not matter, only looks at past inorganics
+  #takes model state unpacked into a list
+  update_inorganics <- function(model_state_old,parms){
+    #retrieve what we need
+      #1/2: paramters
+        k_2 <- parms[["k_2"]] #turnover of root stock
+        k_3 <- parms[["k_3"]] #ash in plant matter
+        R_I <- parms[["R_I"]]#integrated roots, or total bg biomassj
+        B <- parms[["B"]] #aboveground biomass
+      #2/2: state variables   
+        W.i_old <- model_state_old[["W.i"]] #inorganic matter in cohort
+        W.b_old <- model_state_old[["W.b"]] #biomass in cohort
+        
+    #now do update steps 
+        W.i_new <- W.i_old  + k_3 * W.b_old * (k_2 - B/R_I)
+    # update model state
+        model_state_old_new_inorganics <- model_state_old
+        model_state_old_new_inorganics[["W.i"]] <- W.i_new
+    #note:  
+      #above, 
+   return(model_state_old_new_inorganics) 
+  } 
+ 
+ 
+  update_particulate_organic_N <- function(model_state_old, parms) {
+    #retrieve what we need
+    #STOPPED HERE -- 10:57, Monday 12/5
+       #1/2: paramters
+        r <- parms[["r"]] #residece time of soluble N in cohort
+        m <- parms [["m"]] #specific mineralization rate
+        k_2 <- parms[["k_2"]] # turnover of bg, biomass, per year
+        k_6 <- parms[["k_6"]] #specific loss rate of soluble N, per year
+        k_7 <- parms[["k_7"]] #N conc. in roots
+        f_n <- parms[["f_n"]] # N refractory fraction 
+    
+       #2/2: state variables   
+        N.l_old <- model_state_old[["N.l"]]
+        N.r_old <- model_state_old[["N.r"]]
+        W.b_old <- model_state_old[["W.b"]]
+        
+
+    #now compute update steps 
+      N.l_new <- N.l_old  +  k_2 * k_7 * (1-f_n) * W.b_old  - 
+        k_6 * r *m*N.l_old 
+      N.r_new <- N.r_old + k_2 * k_7 * f_n * W.b_old
+    #update model state
+      model_state_old_new_PON <- model_state_old
+      model_state_old_new_PON[["N.l"]] <- N.l_new
+      model_state_old_new_PON[["N.r"]] <- N.r_new
+    return(model_state_old_new_PON)   
+  } 
+  
+  update_P <- function(model_state_old,parms){
+     #retrieve what we need
+        #1/2: paramters
+        r <- parms[["r"]] #residence time of soluble N in cohort
+        k_2 <- parms[["k_2"]] # root turnover
+        k_6 <- parms[["k_6"]] # specific loss rate of soluble N
+        k_10 <- parms[["k_10"]] # P in root biomass
+        k_11 <- parms[["k_11"]] # N:P "ratio of losses"
+        m <- parms[["m"]] #specific mineralization rate of N
+       
+        #2/2: state variables   
+        P.o_old <- model_state_old[["P.o"]]
+        W.b_old <- model_state_old[["W.b"]]
+        N.l_old <- model_state_old[["N.l"]] #labile N needed for calculating gross mineralization rates
+
+ #now compute update steps 
+      P.o_new <- P.o_old + k_10 * k_2 * W.b_old - 
+        k_6 * r * (m* N.l_old)/k_11
+ #update model state
+      model_state_old_new_P <- model_state_old
+      model_state_old_new_P[["P.o"]] <- P.o_new
+      return(model_state_old_new_P) 
+  }
+  
+  
+  
+##########
+### 3/3 cohort process functions, 
+###  set 2, "calculate function", that refer only to current model state
+#########
+  calculate_root_distribution <- function(newish_model_state,parms){
+      #function argument now called newish, because
+        #1) not totally new, needs this calculation to be the whole "new state" 
+        #2) this and soluble N functions do not look to "old state" like above functions,
+            #so note there is no comparrison of old and new model state
+    # 
+    #retrieve what we need
+      #1/2: paramters
+        k_1 <- parms[["k_1"]] #decay constant for bg biomass distribution
+        R_0 <- parms[["R_0"]] #belowground biomass at root surface
+     
+      #2/2: state variables   
+          # newish_model_state <- model_state_list #DEBUG
+          D.u_current <- newish_model_state[["D.u"]]
+          D.b_current <- newish_model_state[["D.b"]]
+          
+      
+      #do calculation 
+          W.b_current <- R_0 *(  exp(-k_1*D.b_current)  - (exp(-k_1*D.u_current))   )/(-k_1) 
+
+      #update model state
+       newish_model_state_new_roots <- newish_model_state
+       newish_model_state_new_roots[["W.b"]] <- W.b_current
+    # glimpse(newish_model_state_new_roots)
+      return(newish_model_state_new_roots)
+  } 
+  
+  calculate_soluble_N <- function(newish_model_state,parms){
+    #called newish, because needs this final update before can be truly called "new state"
+    #retrieve params
+      b_o <- parms[["b_o"]] # bulk density of organic matter
+      r <- parms[["r"]] #residence time of soluble N in cohort
+      m <- parms[["m"]] #mineralization rate of labile N
+      k_8 <- parms[["k_8"]] #density of OM
+      k_9 <- parms[["k_9"]] #density of inorganic matter
+      
+    #retrieve state variables state
+    C.t_current <- newish_model_state[["C.r"]] + newish_model_state[["C.l"]]  #total carbon
+    W.b_current <- newish_model_state[["W.b"]]
+    W.i_current <- newish_model_state[["W.i"]]
+    N.l_current <- newish_model_state[["N.l"]]
+   
+    #make derived cohort values 
+    Cohort_volumes <-  C.t_current/b_o + W.b_current/b_o
+     
+    #do calculation step 
+    N.s_current <- r*m*N.l_current / ( Cohort_volumes - C.t_current/k_8  - W.i_current/k_9 )
+   
+    newish_model_state_new_SN <- newish_model_state
+    newish_model_state_new_SN[["N.s"]] <- N.s_current
+    return(newish_model_state_new_SN)    
+  }
+    
+
+
+```
+
+
+```{r DONT-RUN-THIS-desolve-based--full-run, eval=FALSE, include=FALSE}
+parms <- c( #NOTE: this is name so works inside functions
+  #model/implementation params
+  YEAR_N=200, #number of years to run
+  COHORTS_N=200, #often, year_N = cohorts_N, 
+  # STATE_START_DEFAULT=.000001, #for now, initialize all states to this-- hopefully small enough!
+  STATE_START_DEFAULT=NA, #for now, initialize all states to this-- hopefully small enough!
+  DEPTH_SOLVE_STOP_CRITERION=0.001, #from Morris
+  #science_params
+  k=0.7142, #decay constant for OM, per year -- measured
+  k_1=.1, # decay constant shaping root distribution, per cm-- assumption
+  k_2=0.5, #root turnover, per year-- assumption
+  k_3=0.0344,#concentration of ash in dry matter, dimensionless, measured
+  k_4=0.02,#inorganic sediment, annual load-- g/cm^3: model fit
+  k_5=0.0074,#N conc in leaf litter, dimensionless-- measured
+  k_6=12.0, # specific loss rate of soluble N, per year -- model fit
+  k_7=0.02, #N concentration of bg-biomass -- measured
+  k_8=1.44, #particle density of organic matter, g/cm^3 -- standard
+  k_9=2.6, # particle density of inorganic matter, g/cm^3 -- standard
+  k_10=0.002, #P in live bg biomass, dimensionless -- measured
+  k_11=8.2, # loss N:P ratio, dimensionless-- model fit
+  b_o=0.07182, #bulk density of organic matter, g/cm^3 -- measured
+  B=0.1, #"net annual dry aboveground plant production",g/cm -- measured  
+  f_c=.2, # OM refractory fraction, dimensionless-- measured
+  f_n=0.45, # refractory fraction of organic N-- model fit
+  m=0.6, # gross mineralization rate, per year -- model fit
+  P_0 = 6.73* 10 ^5, #deposition of organic P to marsh surface, g/cm^2 -- measured
+  r=0.0025, #residence time of N.s in cohort, per year-- model fit
+  R_0=0.0105, #live bg biomass at surface, g/cm- "measure d and combined with assumptions
+  R_I=NA, #integrated live belowground biomass, g/cm -- measurement upscaled with assumed depth dist. Hard coded in paper, computed at run time here
+  R_d=30, #rooting depth, assumed
+  W_a=0.1# annual deposition of organic matter onto marsh surface, g/cm -- measured
+   
+  #additions from our implementation
+) %>% 
+  attach_integrated_roots()
+
+# parms["R_I"] <- .1
+
+parms
+
+start_state_vector <- make_SEDIMEC_start_state(parms)
+
+end_time <- parms["YEAR_N"] %>% as.numeric()
+
+test_run <-   ode(
+        func=sedimec_model,
+         y=start_state_vector,
+        times=1:end_time,
+        method="iteration",
+        parms=parms
+        
+  )  %>% 
+  as.data.frame() 
+
+  test_run %>% 
+      filter(time==end_time) %>% 
+      # select(-time) %>% 
+    unpack_model_state() %>% 
+    as_tibble() %>% 
+    pivot_longer(-D.u) %>% 
+        ggplot(aes(x=value,y=-D.u)) +
+        geom_point() +
+        facet_wrap(~name,scales = "free_x") +
+    ylab("depth (cm)")
+  
+
+```
+
+```{r IF-RAN-show-model-output}
+
+sensible_plot <- function(model_output,parms){
+  end_time <- parms["YEAR_N"] %>% as.numeric()
+ 
+  # model_output <- test_run 
+  
+  carbon_row<- model_output %>% 
+      filter(time==end_time) %>% 
+      # select(-time) %>% 
+    unpack_model_state() %>% 
+    as_tibble() %>% 
+    pivot_longer(-D.u) %>% 
+        filter(name %in% c("C.l","C.r","W.b"))  %>% 
+        ggplot(aes(x=value,y=-D.u)) +
+        geom_point() +
+        facet_wrap(~name,scales = "free_x") +
+    ylab("depth (cm)")
+  
+  nitrogen_row <- model_output %>% 
+      filter(time==end_time) %>% 
+      # select(-time) %>% 
+    unpack_model_state() %>% 
+    as_tibble() %>% 
+    pivot_longer(-D.u) %>% 
+        filter(name %in% c("N.l","N.r","N.s"))  %>% 
+        ggplot(aes(x=value,y=-D.u)) +
+        geom_point() +
+        facet_wrap(~name,scales = "free_x") +
+    ylab("depth (cm)")
+  
+    p_and_is_row <- model_output %>% 
+      filter(time==end_time) %>% 
+      # select(-time) %>% 
+    unpack_model_state() %>% 
+    as_tibble() %>% 
+    pivot_longer(-D.u) %>% 
+        filter(name %in% c("P.o","W.i","W.b"))  %>% 
+        ggplot(aes(x=value,y=-D.u)) +
+        geom_point() +
+        facet_wrap(~name,scales = "free_x") +
+    ylab("depth (cm)")
+  
+    carbon_row /
+    nitrogen_row /
+    p_and_is_row
+  
+}
+
+sensible_plot(test_run,parms)
+```
+
+```{r declare-lightweight-run}
+##########  ##########  ##########
+##
+##########  ##########  ##########
+##run model 1 year, formated to be called with below
+  #solve_sedimec_lightweight
+do_lightweight_sedimec_iteration <- function(model_state_old,parms){
+  run_function_verbose <- FALSE
+   new_cohort <- make_new_cohort(parms)
+  
+  ###FIRST: make the updates to model state that refer to last year model state
+    #NOTE: order for carbon and depth matters, as depth looks at new carbon
+      #but if first year, skip all this to start building up a soil column
+    if(length(model_state_old)==0  || is.na(model_state_old[["C.r"]][1])) { 
+       model_state_old_now_aged <- model_state_old
+    }else{
+      model_state_old_now_aged <- model_state_old %>% 
+        update_column_carbon(parms) %>% 
+        update_depth(parms) %>%  #NOTE: carbon must have already been updated
+        update_inorganics(parms) %>% 
+        update_particulate_organic_N(parms) %>% #note, soluble N is below
+        update_P(parms)
+    } 
+ 
+
+  #SECOND: calculate model state values that do not refer to last year model state
+  model_state_new <- model_state_old_now_aged %>% 
+    add_new_cohort(new_cohort,parms) %>%  #TODO: check if you need these parms
+    calculate_root_distribution(parms) %>% 
+    calculate_soluble_N(parms)
+ 
+  #the science choices are over, now correctly pack results and return
+  if(run_function_verbose){
+    print("iter result")
+    glimpse(model_state_new) 
+    
+  }
+  return(model_state_new)
+}
+
+solve_sedimec_lightweight <- function(parms){
+  ##run sedmicec function, updating model state and capturing annual summaries
+    #do not save each annual model state! Only summaries
+    # thus, return just 2 object, final model state and summaries for all years
+  end_time <- parms["YEAR_N"] %>% as.numeric()
+  
+  #initialise the 2 model run outputs, model state and annual summaries
+  current_model_state_list <- make_SEDIMEC_start_state(parms) %>% 
+    unpack_model_state()  
+  annual_summaries_list <- list() #should return NA's
+
+  #run model 
+   for(cur_year in 1:end_time) {
+     # cur_year <- 1
+    
+     #1/3: compute summaries that require old model state 
+        C_out <- sum(parms["k"]*current_model_state_list$C.l,na.rm=T)
+        C_in <-  parms["W_a"] + sum(parms["k_2"]*current_model_state_list$W.b,na.rm=T)
+      
+      #2/3: update model state
+        current_model_state_list <-  do_lightweight_sedimec_iteration(
+                              current_model_state_list, 
+                              parms)
+      #3/3: compute summaries that recquire updated model state 
+         C_soil_total <- sum(current_model_state_list$C.l,na.rm=T) +
+              sum(current_model_state_list$C.r,na.rm=T)
+         C_labile_total <- sum(current_model_state_list$C.l,na.rm=T)#DEBUG
+    
+      #pack the summaries
+      cur_year_summaries_row <- tibble(
+          year=cur_year,
+          soil_depth=max(current_model_state_list$D.b,na.rm=T),
+          C_soil_total,
+          C_labile=C_labile_total,
+          C_gain=C_in,
+          C_loss=C_out
+      )   
+      
+      annual_summaries_list[[cur_year]] <-  cur_year_summaries_row
+   }
+  
+  #format return dataframe, get annual rates
+  annual_summaries_tibble <- annual_summaries_list %>% 
+    map_df(rbind) %>% #turn list from loop into a data frame
+    mutate(C_acc_rate=C_soil_total-lag(C_soil_total))  %>% 
+    mutate(C_labile_acc_rate=C_labile-lag(C_labile))  %>% 
+    mutate(accretion_rate=soil_depth-lag(soil_depth))
+  # annual_summaries_tibble <- annual_summaries_list %>% as_tibble()
+  return_pair <- list(current_model_state_list,annual_summaries_tibble)
+  # return_pair <- list(current_model_state_list,annual_summaries_list)
+  ##TODO: get difs for CAR
+  return(return_pair)
+}
+
+#now obsolete helper function for insight solve_sedimec_lightweight
+compute_summaries <- function(model_state_list,parms){
+  #this function builds up a tibble of summaries for years if lists are all NA, will spot 
+    #if the model_state is the stat_state, with all NA's
+    #the function will return a formated vector with all NA's, which is used above 
+      #in solve_sedimec_lightweight to pre-allocate tibble to be built out in a loop
+  
+  C_total <- sum(model_state_list$C.r,na.rm = T) + 
+    sum(model_state_list$C.l,na.rm=T) + 
+    sum(model_state_list$W.b,na.rm=T) 
+  
+   C_total_no_roots <-  sum(model_state_list$C.r,na.rm = T) + 
+    sum(model_state_list$C.l,na.rm=T) 
+  
+  C_in <- parms["W_a"] + sum(model_state_list$W.b*parms["k_2"],na.rm = T)
+  C_out <- sum(parms["k"] * model_state_list$C.l,na.rm=T)
+  return(tibble(C_total,
+                C_total_no_roots,
+                C_in,
+                C_out)
+         )
+}
+
+
+```
+
+
+```{r run-and-show-outputs-from-Morris-model-with-Morris-parms}
+
+### ### ### ### #
+### Run model!
+### ### ### ### #
+
+###debugging summary computation
+parms <- c( #NOTE: this is name so works inside functions
+  #model/implementation params
+  YEAR_N=200, #number of years to run
+  COHORTS_N=200, #often, year_N = cohorts_N, 
+  # STATE_START_DEFAULT=.000001, #for now, initialize all states to this-- hopefully small enough!
+  STATE_START_DEFAULT=NA, #for now, initialize all states to this-- hopefully small enough!
+  DEPTH_SOLVE_STOP_CRITERION=0.001, #from Morris
+  #science_params
+  k=0.7142, #decay constant for OM, per year -- measured
+  k_1=.1, # decay constant shaping root distribution, per cm-- assumption
+  k_2=0.5, #root turnover, per year-- assumption
+  k_3=0.0344,#concentration of ash in dry matter, dimensionless, measured
+  k_4=0.02,#inorganic sediment, annual load-- g/cm^3: model fit
+  k_5=0.0074,#N conc in leaf litter, dimensionless-- measured
+  k_6=12.0, # specific loss rate of soluble N, per year -- model fit
+  k_7=0.02, #N concentration of bg-biomass -- measured
+  k_8=1.44, #particle density of organic matter, g/cm^3 -- standard
+  k_9=2.6, # particle density of inorganic matter, g/cm^3 -- standard
+  k_10=0.002, #P in live bg biomass, dimensionless -- measured
+  k_11=8.2, # loss N:P ratio, dimensionless-- model fit
+  b_o=0.07182, #bulk density of organic matter, g/cm^3 -- measured
+  B=0.1, #"net annual dry aboveground plant production",g/cm -- measured  
+  f_c=.2, # OM refractory fraction, dimensionless-- measured
+  f_n=0.45, # refractory fraction of organic N-- model fit
+  m=0.6, # gross mineralization rate, per year -- model fit
+  P_0 = 6.73* 10 ^-5, #deposition of organic P to marsh surface, g/cm^2 -- measured
+  r=0.0025, #residence time of N.s in cohort, per year-- model fit
+  R_0=0.0105, #live bg biomass at surface, g/cm- "measure d and combined with assumptions
+  R_I=NA, #integrated live belowground biomass, g/cm -- measurement upscaled with assumed depth dist. Hard coded in paper, computed at run time here
+  R_d=30, #rooting depth, assumed
+  W_a=0.1# annual deposition of organic matter onto marsh surface, g/cm -- measured
+  #additions from our implementation
+) %>% 
+  attach_integrated_roots() 
+  
+test_run_with_summaries <- solve_sedimec_lightweight(parms)
+
+## calculate year the rooting depth is reached!
+year_root_depth_reached <- test_run_with_summaries[[2]] %>% 
+  filter(soil_depth >= parms["R_d"]) %>% 
+  filter(soil_depth==min(soil_depth)) %>% 
+  pull(year)
+
+##quick model check 
+  # make sure accumulation matches losses and gains
+  # this is a very good debug to make sure model is doing what you think
+test_run_with_summaries[[2]] %>% 
+  mutate(in_plus_out=C_gain - C_loss) %>% 
+  ggplot(aes(x=in_plus_out,y=C_acc_rate)) +
+  geom_point() +
+  geom_abline() 
+
+#display output 1-- profile at final time step
+test_run_with_summaries[[1]] %>% 
+  as_tibble() %>% 
+    select(-D.b) %>% 
+     pivot_longer(-c(D.u)) %>% 
+
+        ggplot(aes(x=value,y=-D.u)) +
+        geom_point() +
+        # geom_jitter(aes(color=run_id)) +
+        facet_wrap(~name,scales = "free_x") +
+    ylab("depth (cm)")
+
+#display output 2-- summaries  
+test_run_with_summaries[[2]] %>% 
+  pivot_longer(-year) %>% 
+  ggplot(aes(x=year,y=value,color=name)) +
+  geom_point()  +
+  scale_color_viridis_d() +
+  geom_vline(xintercept = year_root_depth_reached, linetype="dashed") +
+  facet_wrap(~name, scales = "free_y")
+
+
+```
+
+
+Reproduce figures in Morris and Bowden 1986
+```{r direct-test-morris-figures}
+parms <- c( #NOTE: this is name so works inside functions
+  #model/implementation params
+  YEAR_N=200, #number of years to run
+  COHORTS_N=200, #often, year_N = cohorts_N, 
+  # STATE_START_DEFAULT=.000001, #for now, initialize all states to this-- hopefully small enough!
+  STATE_START_DEFAULT=NA, #for now, initialize all states to this-- hopefully small enough!
+  DEPTH_SOLVE_STOP_CRITERION=0.001, #from Morris
+  #science_params
+  k=0.7142, #decay constant for OM, per year -- measured
+  k_1=.1, # decay constant shaping root distribution, per cm-- assumption
+  k_2=0.5, #root turnover, per year-- assumption
+  k_3=0.0344,#concentration of ash in dry matter, dimensionless, measured
+  k_4=0.02,#inorganic sediment, annual load-- g/cm^3: model fit
+  k_5=0.0074,#N conc in leaf litter, dimensionless-- measured
+  k_6=12.0, # specific loss rate of soluble N, per year -- model fit
+  k_7=0.02, #N concentration of bg-biomass -- measured
+  k_8=1.44, #particle density of organic matter, g/cm^3 -- standard
+  k_9=2.6, # particle density of inorganic matter, g/cm^3 -- standard
+  k_10=0.002, #P in live bg biomass, dimensionless -- measured
+  k_11=8.2, # loss N:P ratio, dimensionless-- model fit
+  b_o=0.07182, #bulk density of organic matter, g/cm^3 -- measured
+  B=0.1, #"net annual dry aboveground plant production",g/cm -- measured  
+  f_c=.2, # OM refractory fraction, dimensionless-- measured
+  f_n=0.45, # refractory fraction of organic N-- model fit
+  m=0.6, # gross mineralization rate, per year -- model fit
+  P_0 = 6.73* 10 ^-5, #deposition of organic P to marsh surface, g/cm^2 -- measured
+  r=0.0025, #residence time of N.s in cohort, per year-- model fit
+  R_0=0.0105, #live bg biomass at surface, g/cm- "measure d and combined with assumptions
+  R_I=NA, #integrated live belowground biomass, g/cm -- measurement upscaled with assumed depth dist. Hard coded in paper, computed at run time here
+  R_d=30, #rooting depth, assumed
+  W_a=0.1# annual deposition of organic matter onto marsh surface, g/cm -- measured
+   
+  #additions from our implementation
+) %>% 
+  attach_integrated_roots() 
+
+model_run_morris_param <-
+  solve_sedimec_lightweight(parms) 
+
+hours_in_year <- 8760
+ug_in_g <- 1* 10^6
+
+
+
+model_run_morris_param[[1]] %>% 
+  as_tibble() %>% 
+  mutate(total_organics=C.l + C.r + W.b) %>% 
+  mutate(a._pct_organic=total_organics/(total_organics+W.i)) %>% 
+  mutate(N_total=N.l + N.r + W.b*parms["k_7"]) %>% 
+  mutate(b._pct_N=100*(N_total)/(total_organics)) %>% 
+  mutate(c._pct_P=100*(P.o)/(total_organics)) %>% 
+  mutate(d._N_mineralization=(N.l*parms["m"]/N_total)*ug_in_g/hours_in_year) %>% 
+  mutate(e._N_to_P_ratio=N_total/P.o) %>% 
+  select(-D.b) %>%
+  select(a._pct_organic,b._pct_N,c._pct_P,d._N_mineralization,D.u,e._N_to_P_ratio) %>% 
+     pivot_longer(-c(D.u)) %>% 
+
+        ggplot(aes(x=value,y=-D.u)) +
+        geom_point() +
+        # geom_jitter(aes(color=run_id)) +
+        facet_wrap(~name,scales = "free_x") +
+    ylab("depth (cm)") +
+  ggtitle("figures in Morris 1986 for verifying implementation")
+
+```
+
+```{r show-car-with-3-root-conditions}
+#2 ways to do this
+  # 1) R_S ratio
+    # (.66x, x, 2x)
+  # 2) by bg biomass
+    # (.65 x, x, 1.5x)
+    # well! to make the figures look right, i'm doing .5, 1, 1.5
+
+#do conservative, by bg biomass
+get_surface_roots_for_root_total <- function(integrated_roots,k,d){
+  #given an integral over an exponentially declining root profile, compute I
+  (integrated_roots * k)/
+    (1-exp(-k*d))
+}
+
+
+# root_reduction_multiplier <- .66
+root_reduction_multiplier <- .5
+root_elevation_multiplier <- 1.5
+
+
+R_0_reduced_roots <- get_surface_roots_for_root_total(
+  integrated_roots = root_reduction_multiplier*parms["R_I"],
+  k=parms["k_1"],
+  d=parms["R_d"]
+)
+
+R_0_elevated_roots <- get_surface_roots_for_root_total(
+  integrated_roots = root_elevation_multiplier*parms["R_I"],
+  k=parms["k_1"],
+  d=parms["R_d"]
+)
+
+##set parms
+##
+parms_base_case <- parms
+
+parms_reduced_roots <- parms_base_case
+parms_reduced_roots["R_0"] <- R_0_reduced_roots
+parms_reduced_roots <- parms_reduced_roots %>% 
+  attach_integrated_roots()
+
+parms_elevated_roots <- parms_base_case
+parms_elevated_roots["R_0"] <- R_0_elevated_roots
+parms_elevated_roots <- parms_elevated_roots %>% 
+  attach_integrated_roots()
+
+## ## ## ## ## ## ## ## ## 
+## run models
+## ## ## ## ## ## ## ## ## 
+##helper function for labeling runs!
+    add_run_name_to_model_output <- function(model_output,run_name){
+      model_output[[1]] <- model_output[[1]] %>% 
+        as_tibble() %>% 
+        mutate(run_id=run_name)
+      
+      model_output[[2]] <- model_output[[2]] %>% 
+        mutate(run_id=run_name)
+      return(model_output)
+      
+    }
+
+  model_run_morris_param <- solve_sedimec_lightweight(parms_base_case) %>% 
+    add_run_name_to_model_output(run_name="base_case") 
+    
+ 
+  model_run_reduced_roots <- solve_sedimec_lightweight(parms_reduced_roots) %>% 
+    add_run_name_to_model_output(run_name = "reduced_roots")
+  
+  model_run_elevated_roots <- solve_sedimec_lightweight(parms_elevated_roots) %>% 
+    add_run_name_to_model_output(run_name="elevated_roots")
+
+
+#plot the raw profiles
+rbind(
+  model_run_morris_param[[1]],
+  model_run_reduced_roots[[1]],
+  model_run_elevated_roots[[1]]
+) %>% 
+  select(-D.b) %>% 
+  pivot_longer(-c(D.u,run_id)) %>% 
+    ggplot(aes(x=value,y=-D.u)) +
+    geom_point(aes(color=run_id),alpha=.2) +
+    facet_wrap(~name,scales = "free_x") +
+    ylab("depth (cm)")
+
+## plot Morris summaries
+rbind(
+  model_run_morris_param[[1]],
+  model_run_reduced_roots[[1]],
+  model_run_elevated_roots[[1]]
+) %>% 
+  ## compute Morris summaries
+  mutate(total_organics=C.l + C.r + W.b) %>% 
+  mutate(a._pct_organic=total_organics/(total_organics+W.i)) %>% 
+  mutate(N_total=N.l + N.r + W.b*parms["k_7"]) %>% 
+  mutate(b._pct_N=100*(N_total)/(total_organics)) %>% 
+  mutate(c._pct_P=100*(P.o)/(total_organics)) %>% 
+  mutate(d._N_mineralization=(N.l*parms["m"]/N_total)*ug_in_g/hours_in_year) %>% 
+  mutate(e._N_to_P_ratio=N_total/P.o) %>% 
+  ##
+  ## select the Morris summaries
+  select(run_id,D.u,a._pct_organic,b._pct_N,c._pct_P,d._N_mineralization,e._N_to_P_ratio) %>% 
+  pivot_longer(-c(D.u,run_id)) %>% 
+    ggplot(aes(x=value,y=-D.u)) +
+    geom_point(aes(color=run_id),alpha=.2) +
+    facet_wrap(~name,scales = "free_x") +
+    ylab("depth (cm)")
+#
+
+## plot CAR over time
+rbind(
+  model_run_morris_param[[2]],
+  model_run_reduced_roots[[2]],
+  model_run_elevated_roots[[2]]
+) %>% 
+  pivot_longer(-c(run_id,year)) %>% 
+  ggplot(aes(x=year,y=value)) +
+  geom_point(aes(color=run_id)) +
+  facet_wrap(~name,scales="free_y")
+
+
+.8/parms["k"] * (.1 + sum(model_run_morris_param[[1]]$W.b*.5,na.rm=T))
+
+```
+
+
+```{r sweep-individual-params}
+elevated_k_6 <- 24
+elevated_m <- 1.2
+elevated_R_0 <- .02
+
+
+#high k_6
+model_run_morris_param<- solve_sedimec_lightweight(parms) %>% 
+  .[[1]]  %>% #unpack, [[2]] are summaries
+  as_tibble() %>% 
+  mutate(run_id="morris_params")
+
+
+#high k_6
+parms_high_k_6 <- parms
+parms_high_k_6["k_6"] <- elevated_k_6# (twice the 12)
+model_run_high_k_6 <- solve_sedimec_lightweight(parms_high_k_6) %>% 
+  .[[1]] %>% 
+  as_tibble() %>% 
+  mutate(run_id="k_6_elevated")
+
+#high m
+parms_high_m <- parms
+parms_high_m["m"] <- elevated_m# (twice the 12)
+model_run_high_m <- solve_sedimec_lightweight(parms_high_m) %>% 
+  .[[1]] %>% 
+  as_tibble() %>% 
+  mutate(run_id="m_elevated")
+
+#high R_0
+parms_high_R_0 <- parms
+parms_high_R_0["R_0"] <- elevated_R_0# (twice the 12)
+model_run_high_R_0<- solve_sedimec_lightweight(parms_high_R_0) %>% 
+  .[[1]] %>% 
+  as_tibble() %>% 
+  mutate(run_id="R_0_elevated")
+
+
+rbind(
+  model_run_morris_param,
+  model_run_high_k_6,
+  model_run_high_m,
+  model_run_high_R_0
+) %>% 
+#re-order with numbers if need be
+# model_sweep_invidual_params %>% 
+  #this should be a dataframe
+  #column run_id
+      #string with name of varied param
+  select(-D.b) %>% 
+     pivot_longer(-c(D.u,run_id)) %>% 
+
+        ggplot(aes(x=value,y=-D.u)) +
+        geom_point(aes(color=run_id),alpha=.2) +
+        # geom_jitter(aes(color=run_id)) +
+        facet_wrap(~name,scales = "free_x") +
+    ylab("depth (cm)")
+
+ 
+  
+```
+
+```{r wrap-individual-parm-sweep}
+elevated_k_6 <- 24
+elevated_m <- 1.2
+elevated_R_0 <- .02
+
+
+
+
+sweep_with_invidual_parm_values <- function(elevated_k_6_arg, elevated_m_arg, elevated_R_0_arg){
+  model_run_morris_param<- solve_sedimec_lightweight(parms) %>% 
+    .[[1]] %>% 
+    as_tibble() %>% 
+    mutate(run_id="morris_params")
+  
+  
+  #high k_6
+  parms_high_k_6 <- parms
+  parms_high_k_6["k_6"] <- elevated_k_6_arg# (twice the 12)
+  model_run_high_k_6 <- solve_sedimec_lightweight(parms_high_k_6) %>% 
+    .[[1]] %>% 
+    as_tibble() %>% 
+    mutate(run_id="k_6_elevated")
+  
+  #high m
+  parms_high_m <- parms
+  parms_high_m["m"] <- elevated_m_arg# (twice the 12)
+  model_run_high_m <- solve_sedimec_lightweight(parms_high_m) %>% 
+    .[[1]] %>% 
+    as_tibble() %>% 
+    mutate(run_id="m_elevated")
+  
+  #high R_0
+  parms_high_R_0 <- parms
+  parms_high_R_0["R_0"] <- elevated_R_0_arg# (twice the 12)
+  model_run_high_R_0<- solve_sedimec_lightweight(parms_high_R_0) %>% 
+    .[[1]] %>% 
+    as_tibble() %>% 
+    mutate(run_id="R_0_elevated")
+  
+  
+  rbind(
+    model_run_morris_param,
+    model_run_high_k_6,
+    model_run_high_m,
+    model_run_high_R_0
+  ) 
+}
+
+model_out_individual_param_sweep <- sweep_with_invidual_parm_values(
+  elevated_k_6_arg = elevated_k_6,
+  elevated_m_arg = elevated_m,
+  elevated_R_0_arg = elevated_R_0
+  )
+
+#high k_6
+#re-order with numbers if need be
+# model_sweep_invidual_params %>% 
+  #this should be a dataframe
+  #column run_id
+      #string with name of varied param
+model_out_individual_param_sweep %>% 
+  mutate(total_organics=C.l + C.r + W.b) %>% 
+  mutate(pct_organic=total_organics/(total_organics+W.i)) %>% 
+  mutate(pct_organic=total_organics/(total_organics+W.i)) %>% 
+  mutate(pct_N=100*(N.l + N.r + W.b*parms["k_7"])/(total_organics)) %>% 
+  mutate(pct_P=100*(P.o)/(total_organics)) %>% 
+    
+  select(-D.b) %>% 
+     pivot_longer(-c(D.u,run_id)) %>% 
+
+        ggplot(aes(x=value,y=-D.u)) +
+        geom_point(aes(color=run_id)) +
+        # geom_jitter(aes(color=run_id)) +
+        facet_wrap(~name,scales = "free_x") +
+    ylab("depth (cm)")
+
+ 
+```
+
+
+
