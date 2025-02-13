@@ -1,4 +1,4 @@
-##Implementaion of Bowden and Morris 1986 cohort model
+## Implementaion of Bowden and Morris 1986 cohort model
 This is an implementation of the model from Bowden and Morris 1986 I did in Winter 2023. 
 
 Full citation:
