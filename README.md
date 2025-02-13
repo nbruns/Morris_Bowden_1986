@@ -7,4 +7,4 @@ Morris, J., & Bowden, W. (1986). A mechanistic, numerical model of sedimentation
 This is the original cohort model in salt marshes, and its later development is nicely reviewed in Vahsen et. al:
 Vahsen, M. L., Todd-Brown, K. E. O., Hicks, J., Pilyugin, S. S., Morris, J. T., & Holmquist, J. R. (2024). Cohort Marsh Equilibrium Model (CMEM): History, Mathematics, and Implementation. Journal of Geophysical Research: Biogeosciences, 129(4), e2023JG007823. https://doi.org/10.1029/2023JG007823
 
-I got interested in this model because it has not only C but also N dynamics. N dynamics would later be dropped from marsh cohort models.
+I got interested in this model because it has not only C but also N dynamics. N dynamics would later be dropped from marsh cohort models. I also was interested in demonstrating salt marsh cohort models in R and not the more common Matlab.
