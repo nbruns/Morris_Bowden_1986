@@ -1,0 +1,155 @@
+---
+title: "Showing deSolve capabilities"
+author: "Nicholas Bruns"
+date: "12/03/2022"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+Some demonstrations of what you can do with R's environment for working with
+dynamic models, deSolve. The syntax matches matlab's ode solvers, like ode45.
+
+```{r}
+library(deSolve)
+library(tidyverse)
+```
+
+
+```{r continuous-decomp}
+simple_C_decomp_continuous <- function(t,x,parms){
+  k <- parms["k"]
+  soil_C_old <- x[1]
+  
+  soil_C_new <- - soil_C_old*k  #dC/dt
+  
+  return(list(soil_C_new))
+}
+
+#declare run paramters
+year_N <- 15
+start_state <- 3
+k <- .3
+
+
+#run and plot
+test_run <- ode(
+        func=simple_C_decomp_continuous,
+         y=c(
+           C_conc=start_state
+           ),
+        times=seq(1,year_N,by=.1),
+        # method="iteration",
+        parms=c(k=k)
+) %>% 
+  as.data.frame()
+
+
+test_run
+
+test_run %>% 
+  ggplot(aes(x=time,y=C_conc)) +
+  geom_point()
+
+```
+
+
+Same process, as a discrete time model (like our annual model)
+
+```{r discrete-decomp}
+simple_C_decomp_discrete <- function(t,x,parms){
+  k <- parms["k"]
+  soil_C_old <- x[1]
+  
+  soil_C_new <- soil_C_old - soil_C_old*k #difference equation
+  return(list(soil_C_new))
+}
+
+
+
+#declare run paramters
+year_N <- 15
+start_state <- 3
+k <- .3
+
+
+#run and plot
+test_run <- ode(
+        func=simple_C_decomp_discrete,
+         y=c(
+           C_conc=start_state
+           ),
+        times=1:year_N,
+        method="iteration",
+        parms=c(k=k)
+) %>% 
+  as.data.frame()
+
+test_run
+
+test_run %>% 
+  ggplot(aes(x=time,y=C_conc)) +
+  geom_point()
+
+```
+
+Now, do a soil cohort model 
+
+```{r soil_column-test}
+
+simple_C_decomp_soil_column<- function(t,x,parms){
+  k <- parms["k"]
+  new_cohort_C <- parms["new_cohort_C"]
+  
+  #similar to above difference equationn, on vectors 
+  x_aged_truncated <- (x - k*x) %>% 
+    head(-1) #chop the end, below add the new
+        
+  x_new <- c(new_cohort_C,x_aged_truncated)
+  
+  return(list(x_new))
+}
+
+
+#declare variables for our run
+year_N  <-20
+init_column_carbon <- 1.25
+decomp_rate <- .15
+new_cohort_C <- 2
+
+
+#prep run variable
+start_state_vector <- rep(1.25,year_N)
+names(start_state_vector) <- 1:year_N
+run_parms <-c( k= decomp_rate, 
+               new_cohort_C= new_cohort_C)
+
+#run test
+test_run <-   ode(
+        func=simple_C_decomp_soil_column,
+         y=start_state_vector,
+        times=1:year_N,
+        method="iteration",
+        parms=run_parms
+  )  %>% 
+  as.data.frame() 
+
+test_run
+  #matrix sized: time by soil cohort N  
+#plot test
+test_run %>% 
+  pivot_longer(-time) %>% 
+  # print()
+  # glimpse()
+
+  mutate(depth=-as.numeric(name)) %>% 
+  # ggplot(aes(x=value,y=as.numeric(name),color=as.factor(time))) +
+  ggplot(aes(x=value,y=depth)) +
+  # geom_line() +
+  geom_point() +
+  facet_wrap(~time) +
+  xlab("C content")
+#y=depth, x=
+```
+it totally works
+
